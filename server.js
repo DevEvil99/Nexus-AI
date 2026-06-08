@@ -14,7 +14,8 @@ const OpenAI = require("openai");
 const {
   env
 } = require('process');
-
+const fs = require('fs');
+const WATERMARK_PATH = path.join(__dirname, 'img', 'watermark.png');
 
 const app = express();
 const PORT = 5500;
@@ -158,72 +159,92 @@ app.post('/chat', async (req, res) => {
 
 async function generateImage(prompt, userId) {
   const controller = new AbortController();
+  
   const timeout = setTimeout(() => {
     controller.abort();
-  }, 60000);
+  }, 600000);
 
   try {
-    if (!prompt || typeof prompt !== 'string' || prompt.trim() === '') {
-      throw new Error('Invalid or empty prompt provided for image generation.');
+
+    if (!prompt || typeof prompt !== "string" || prompt.trim() === "") {
+      throw new Error("Invalid or empty prompt provided.");
     }
 
-    const response = await fetch('https://router.huggingface.co/together/v1/images/generations', {
-      headers: {
-        Authorization: `Bearer ${process.env.HUGGING_FACE_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      method: 'POST',
-      body: JSON.stringify({
-        prompt: prompt,
-        response_format: 'base64',
-        model: 'black-forest-labs/FLUX.1-Krea-dev',
-      }),
-      signal: controller.signal,
-    });
+    if (!process.env.HUGGING_FACE_API_KEY) {
+      throw new Error("HUGGING_FACE_API_KEY is missing in .env file");
+    }
+
+    console.log("Generating image...");
+
+    const response = await fetch(
+      "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell",
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.HUGGING_FACE_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        method: "POST",
+        body: JSON.stringify({
+          inputs: prompt,
+          parameters: {
+            num_inference_steps: 5,
+          },
+        }),
+        signal: controller.signal,
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const imageBlob = await response.blob();
 
     clearTimeout(timeout);
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => 'Unable to read error response body');
-      console.error('Image generation API error:', {
-        status: response.status,
-        statusText: response.statusText,
-        responseBody: errorText,
-        prompt,
-        userId,
-      });
-      throw new Error(`Failed to fetch image from API: ${response.status} ${response.statusText} - ${errorText}`);
+    console.log("Image generated successfully");
+
+    const arrayBuffer = await imageBlob.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    let watermarkImage;
+
+    try {
+      watermarkImage = fs.readFileSync(WATERMARK_PATH);
+    } catch (err) {
+      throw new Error(`Failed to load watermark image from ${WATERMARK_PATH}: ${err.message}`);
     }
 
-    const result = await response.json();
-    if (!result.data || !result.data[0] || !result.data[0].b64_json) {
-      console.error('Invalid API response format:', {
-        response: result,
-        prompt,
-        userId,
-      });
-      throw new Error('Invalid API response: Missing base64 image data.');
-    }
+    const watermarkedImage = await sharp(buffer)
+      .composite([
+        {
+          input: watermarkImage,
+          gravity: "northwest",
+          blend: "over",
+        },
+      ])
+      .png()
+      .toBuffer();
 
-    const base64Data = result.data[0].b64_json;
-    const buffer = Buffer.from(base64Data, 'base64');
+    const safePrompt = prompt
+      .replace(/[^a-zA-Z0-9]/g, "_")
+      .substring(0, 50);
 
-    const imageName = `${userId}-${Date.now()}-${prompt.replace(/[^a-zA-Z0-9]/g, '_')}.png`;
-
-    const readableStream = new Readable();
-    readableStream.push(buffer);
-    readableStream.push(null);
+    const imageName = `${userId}-${Date.now()}-${safePrompt}.png`;
 
     const ftpClient = new ftp.Client();
+
     try {
       await ftpClient.access(ftpConfig);
-      await ftpClient.uploadFrom(readableStream, `/${imageName}`);
+
+      const readableStream = new Readable();
+      readableStream.push(watermarkedImage);
+      readableStream.push(null);
+
+      await ftpClient.uploadFrom(readableStream, imageName);
+
+      console.log("FTP upload successful");
     } catch (err) {
-      console.error('FTP upload error:', {
-        error: err.message,
-        imageName,
-        userId,
-      });
       throw new Error(`FTP upload failed: ${err.message}`);
     } finally {
       ftpClient.close();
@@ -231,26 +252,26 @@ async function generateImage(prompt, userId) {
 
     // Change "[your_domain]" to the domain of your FTP where images are hosted on
     return `https://[your_domain]/${imageName}`;
+
   } catch (error) {
-    if (error.name === 'AbortError') {
-      console.error('Image generation timed out:', {
-        prompt,
-        userId,
-        timeout: '60 seconds',
-      });
-      throw new Error('Image generation request timed out after 60 seconds.');
+    clearTimeout(timeout);
+
+    if (error.name === "AbortError") {
+      console.error("Image generation timed out");
+      return null;
     }
 
-    console.error('Error generating image:', {
-      error: error.message,
+    console.error("Error generating image with watermark:", {
+      message: error.message,
+      cause: error.cause,
+      stack: error.stack,
       prompt,
       userId,
-      stack: error.stack,
     });
+
     return null;
   }
 }
-
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
 });
